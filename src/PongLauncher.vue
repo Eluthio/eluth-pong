@@ -769,6 +769,17 @@ onUnmounted(() => {
 })
 
 watch(gameOpen, (v) => { if (!v) stopGameLoop() })
+
+watch(() => props.channelId, () => {
+    stopGameLoop()
+    currentRoom.value   = null
+    activeRoom.value    = null
+    mySeat.value        = null
+    gameOpen.value      = false
+    isRoomCreator.value = false
+    open.value          = false
+    checkActiveRoom()
+})
 </script>
 
 <style scoped>
