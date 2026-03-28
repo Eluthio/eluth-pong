@@ -76,9 +76,10 @@
             </div>
         </Teleport>
 
-        <!-- Game panel (pinned above input bar) -->
+        <!-- Game panel (centered popup) -->
         <Teleport to="body">
-            <div v-if="gameOpen && currentRoom" class="pong-panel" :style="panelStyle">
+            <div v-if="gameOpen && currentRoom" class="pong-backdrop">
+            <div class="pong-panel">
                 <div class="pong-panel-header">
                     <span class="pong-panel-title">
                         🏓
@@ -127,6 +128,7 @@
                         @click="abandonGame"
                     >Abandon</button>
                 </div>
+            </div>
             </div>
         </Teleport>
     </div>
@@ -194,9 +196,8 @@ const ball   = ref({ x: 0.5, y: 0.5, vx: BALL_SPEED_INIT, vy: BALL_SPEED_INIT * 
 // Config for new game
 const config = ref({ scoreLimit: 5, p1Color: '#ffffff', p2Color: '#ff4444' })
 
-// Panel positioning
+// Config panel positioning
 const configStyle = ref({})
-const panelStyle  = ref({})
 
 // Timing & loops
 let rafId      = null
@@ -247,11 +248,6 @@ function computeStyles() {
     configStyle.value = {
         left:   Math.max(8, Math.min(rect.left, window.innerWidth - 280)) + 'px',
         bottom: (window.innerHeight - rect.top + 8) + 'px',
-    }
-    panelStyle.value = {
-        left:   Math.max(8, rect.left - 120) + 'px',
-        bottom: (window.innerHeight - rect.top + 8) + 'px',
-        width:  (CW + 2) + 'px',
     }
 }
 
@@ -845,15 +841,22 @@ watch(gameOpen, (v) => { if (!v) stopGameLoop() })
 .pong-config-active { text-align: center; }
 .pong-config-active p { font-size: 12px; color: rgba(255,255,255,0.5); margin: 0 0 8px; }
 
+/* Game panel backdrop */
+.pong-backdrop {
+    position: fixed; inset: 0; z-index: 9998;
+    background: rgba(0,0,0,0.55);
+    display: flex; align-items: center; justify-content: center;
+}
+
 /* Game panel */
 .pong-panel {
-    position: fixed; z-index: 9998;
     background: #111;
     border: 1px solid rgba(255,255,255,0.1);
     border-radius: 10px;
     overflow: hidden;
     box-shadow: 0 12px 48px rgba(0,0,0,0.7);
     display: flex; flex-direction: column;
+    width: 482px;
 }
 .pong-panel-header {
     display: flex; align-items: center; justify-content: space-between;
