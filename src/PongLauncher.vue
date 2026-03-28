@@ -150,13 +150,14 @@ const CH = 290
 const PADDLE_W = 10
 const PADDLE_H = 64
 const BALL_SZ  = 9
-const PADDLE_SPEED = 0.016       // fraction of canvas height per frame
+const PADDLE_SPEED     = 0.016   // fraction of canvas height per frame
 const BALL_SPEED_INIT  = 0.0045  // fraction of CW per frame at 60fps
 const BALL_SPEED_MAX   = 0.012
 const BALL_SPEED_ACCEL = 1.03    // speed multiplier per paddle hit
-const SYNC_INTERVAL    = 100     // ms between state pushes
-const POLL_INTERVAL    = 100     // ms between state polls (P2/spectator)
 const CHECK_INTERVAL   = 4000    // ms between active-game checks
+const SPECTATOR_POLL   = 300     // ms for spectator HTTP poll
+const SIGNAL_INTERVAL  = 1200    // ms between signaling polls
+const ICE_SERVERS      = [{ urls: 'stun:stun.l.google.com:19302' }]
 
 const COLORS = [
     { label: 'White',   value: '#ffffff' },
@@ -177,18 +178,18 @@ const gameOpen  = ref(false)
 const creating  = ref(false)
 
 // Network state
-const activeRoom  = ref(null)   // active game in channel (from periodic check)
-const currentRoom = ref(null)   // the room we're playing/watching
-const mySeat      = ref(null)   // 1 or 2 (or null = spectator)
-const myUserId    = computed(() => props.currentMember?.id ?? null)
+const activeRoom    = ref(null)   // active game in channel (from periodic check)
+const currentRoom   = ref(null)   // the room we're playing/watching
+const mySeat        = ref(null)   // 1 or 2 (or null = spectator)
+const myUserId      = computed(() => props.currentMember?.id ?? null)
 const isRoomCreator = ref(false)
 
 // Game state (normalised 0–1)
-const p1y   = ref(0.5)
-const p2y   = ref(0.5)
+const p1y    = ref(0.5)
+const p2y    = ref(0.5)
 const score1 = ref(0)
 const score2 = ref(0)
-const ball  = ref({ x: 0.5, y: 0.5, vx: BALL_SPEED_INIT, vy: BALL_SPEED_INIT * 0.7 })
+const ball   = ref({ x: 0.5, y: 0.5, vx: BALL_SPEED_INIT, vy: BALL_SPEED_INIT * 0.7 })
 
 // Config for new game
 const config = ref({ scoreLimit: 5, p1Color: '#ffffff', p2Color: '#ff4444' })
@@ -198,11 +199,20 @@ const configStyle = ref({})
 const panelStyle  = ref({})
 
 // Timing & loops
-let rafId = null
-let syncTimer = null
-let pollTimer = null
+let rafId      = null
+let pollTimer  = null   // spectator HTTP poll only
 let checkTimer = null
 const keys = {}
+
+// WebRTC
+let pc               = null   // RTCPeerConnection
+let dc               = null   // RTCDataChannel
+let rtcPhase         = 'idle' // 'idle' | 'signaling' | 'connected' | 'failed'
+let signalingTimer   = null
+let localIce         = []     // gathered ICE candidates (full list, overwritten on server)
+let remoteIceApplied = 0      // how many remote ICE candidates we've already added
+let answerSent       = false  // P2: have we sent our SDP answer yet?
+let answerApplied    = false  // P1: have we applied P2's SDP answer yet?
 
 // Invited user (from context menu)
 const invitedUsername = ref(null)
@@ -234,14 +244,10 @@ function playerName(idx) {
 function computeStyles() {
     const rect = wrapRef.value?.getBoundingClientRect()
     if (!rect) return
-
-    // Config panel: above the button
     configStyle.value = {
         left:   Math.max(8, Math.min(rect.left, window.innerWidth - 280)) + 'px',
         bottom: (window.innerHeight - rect.top + 8) + 'px',
     }
-
-    // Game panel: full-width above input bar, pinned to bottom-left of channel area
     panelStyle.value = {
         left:   Math.max(8, rect.left - 120) + 'px',
         bottom: (window.innerHeight - rect.top + 8) + 'px',
@@ -251,12 +257,8 @@ function computeStyles() {
 
 // ── Toggle ─────────────────────────────────────────────────────────────────
 function toggle() {
-    if (!open.value) {
-        computeStyles()
-        open.value = true
-    } else {
-        open.value = false
-    }
+    if (!open.value) { computeStyles(); open.value = true }
+    else open.value = false
 }
 
 function openGame() {
@@ -298,10 +300,12 @@ async function checkActiveRoom() {
     try {
         const data = await api('GET', `/plugin-rooms/pong/channels/${props.channelId}`)
         activeRoom.value = data?.room ?? null
-        // If we have a current game that just finished, sync it
         if (currentRoom.value && data?.room?.id === currentRoom.value.id) {
             currentRoom.value = data.room
-            applyRoomState(data.room)
+            // Only apply server state for room metadata (status, player list)
+            // not game physics — that comes from WebRTC once connected
+            if (rtcPhase !== 'connected') applyRoomState(data.room)
+            else currentRoom.value = data.room
         }
     } catch {}
 }
@@ -318,9 +322,6 @@ async function createGame() {
                 p1_color:    config.value.p1Color,
                 p2_color:    config.value.p2Color,
                 score1: 0, score2: 0,
-                p1_y: 0.5, p2_y: 0.5,
-                ball_x: 0.5, ball_y: 0.5,
-                ball_vx: BALL_SPEED_INIT, ball_vy: BALL_SPEED_INIT * 0.7,
                 winner: null,
                 invited: invitedUsername.value ?? null,
             },
@@ -331,17 +332,14 @@ async function createGame() {
         isRoomCreator.value = true
         open.value = false
 
-        // Post the game link to chat
         const gameUrl = window.location.origin + '/pong-game/' + room.id
         const mention = invitedUsername.value ? `@${invitedUsername.value} ` : ''
         emit('insert', mention + gameUrl)
         invitedUsername.value = null
 
-        // Auto-join as player 1
         await joinGame()
     } catch (e) {
         console.warn('[pong] create failed', e)
-        // If already active game, open it
         await checkActiveRoom()
         if (activeRoom.value) openGame()
     } finally {
@@ -353,13 +351,12 @@ async function joinGame() {
     if (!currentRoom.value) return
     try {
         const data = await api('POST', `/plugin-rooms/pong/${currentRoom.value.id}/seat`)
-        mySeat.value    = data.seat
+        mySeat.value     = data.seat
         currentRoom.value = data.room
         computeStyles()
         gameOpen.value = true
         startGameLoop()
-    } catch (e) {
-        // Seat taken — open as spectator
+    } catch {
         mySeat.value = null
         computeStyles()
         gameOpen.value = true
@@ -372,7 +369,7 @@ async function abandonGame() {
     try {
         await api('POST', `/plugin-rooms/pong/${currentRoom.value.id}/close`)
         stopGameLoop()
-        gameOpen.value  = false
+        gameOpen.value    = false
         currentRoom.value = null
         activeRoom.value  = null
     } catch {}
@@ -388,29 +385,23 @@ function syncSeatFromRoom() {
 // ── Game loop ──────────────────────────────────────────────────────────────
 function startGameLoop() {
     stopGameLoop()
+    rafId = requestAnimationFrame(gameLoop)
 
-    if (mySeat.value === 1) {
-        // Player 1: run physics, push state
-        rafId = requestAnimationFrame(gameLoop)
-        syncTimer = setInterval(pushState, SYNC_INTERVAL)
-    } else if (mySeat.value === 2) {
-        // Player 2: run local movement, push own paddle, poll ball from P1
-        rafId = requestAnimationFrame(gameLoop)
-        syncTimer = setInterval(pushState, SYNC_INTERVAL)
-        pollTimer = setInterval(pullState, POLL_INTERVAL)
+    if (mySeat.value === 1 || mySeat.value === 2) {
+        // Start WebRTC signaling; HTTP sync only kicks in as fallback
+        startWebRTC()
     } else {
-        // Spectator
-        rafId = requestAnimationFrame(gameLoop)
-        pollTimer = setInterval(pullState, POLL_INTERVAL * 3)
+        // Spectator: HTTP poll only
+        pollTimer = setInterval(spectatorPoll, SPECTATOR_POLL)
     }
 
     nextTick(() => canvasRef.value?.focus())
 }
 
 function stopGameLoop() {
-    if (rafId)      { cancelAnimationFrame(rafId); rafId = null }
-    if (syncTimer)  { clearInterval(syncTimer);    syncTimer = null }
-    if (pollTimer)  { clearInterval(pollTimer);    pollTimer = null }
+    if (rafId)     { cancelAnimationFrame(rafId); rafId = null }
+    if (pollTimer) { clearInterval(pollTimer);    pollTimer = null }
+    stopWebRTC()
 }
 
 function gameLoop() {
@@ -430,17 +421,15 @@ function update() {
         if (keys['ArrowUp'])   p1y.value = Math.max(PADDLE_H / 2 / CH, p1y.value - speed)
         if (keys['ArrowDown']) p1y.value = Math.min(1 - PADDLE_H / 2 / CH, p1y.value + speed)
 
-        // Ball physics (P1 is authoritative)
+        // Ball physics — P1 is authoritative
         const b = ball.value
         b.x += b.vx
         b.y += b.vy
 
-        // Wall bounce (top/bottom)
         const ballRY = BALL_SZ / 2 / CH
-        if (b.y - ballRY <= 0)  { b.y = ballRY;      b.vy = Math.abs(b.vy) }
-        if (b.y + ballRY >= 1)  { b.y = 1 - ballRY;  b.vy = -Math.abs(b.vy) }
+        if (b.y - ballRY <= 0) { b.y = ballRY;      b.vy = Math.abs(b.vy) }
+        if (b.y + ballRY >= 1) { b.y = 1 - ballRY;  b.vy = -Math.abs(b.vy) }
 
-        // Left paddle collision
         const p1Rect = { x: 12 / CW, y: p1y.value, h: PADDLE_H / CH }
         if (b.vx < 0 && b.x - BALL_SZ/2/CW <= p1Rect.x + PADDLE_W/CW &&
             Math.abs(b.y - p1Rect.y) < p1Rect.h / 2 + BALL_SZ/2/CH) {
@@ -449,7 +438,6 @@ function update() {
             b.x   = (12 + PADDLE_W + BALL_SZ / 2) / CW
         }
 
-        // Right paddle collision
         const p2Rect = { x: (CW - 12 - PADDLE_W) / CW, y: p2y.value, h: PADDLE_H / CH }
         if (b.vx > 0 && b.x + BALL_SZ/2/CW >= p2Rect.x &&
             Math.abs(b.y - p2Rect.y) < p2Rect.h / 2 + BALL_SZ/2/CH) {
@@ -458,18 +446,21 @@ function update() {
             b.x   = p2Rect.x - BALL_SZ/2/CW
         }
 
-        // Clamp vy
         const maxVy = Math.abs(b.vx) * 1.2
         b.vy = Math.max(-maxVy, Math.min(maxVy, b.vy))
 
-        // Scoring
         if (b.x < 0) { score2.value++; checkWin(); resetBall(-1) }
         if (b.x > 1) { score1.value++; checkWin(); resetBall(1) }
+
+        // Send state to P2 via data channel (high-frequency)
+        sendGameState()
 
     } else if (mySeat.value === 2) {
         if (keys['ArrowUp'])   p2y.value = Math.max(PADDLE_H / 2 / CH, p2y.value - speed)
         if (keys['ArrowDown']) p2y.value = Math.min(1 - PADDLE_H / 2 / CH, p2y.value + speed)
-        // Ball and P1 paddle come from server (applied via applyRoomState)
+
+        // Send paddle to P1 via data channel
+        sendGameState()
     }
 }
 
@@ -487,37 +478,178 @@ async function checkWin() {
     if (score1.value >= limit || score2.value >= limit) {
         const winner = score1.value >= limit ? 'p1' : 'p2'
         try {
+            // Broadcast winner to peer first
+            if (dc?.readyState === 'open') {
+                dc.send(JSON.stringify({ winner, score1: score1.value, score2: score2.value }))
+            }
             await api('PUT', `/plugin-rooms/pong/${currentRoom.value.id}/data`, {
                 data: { winner, score1: score1.value, score2: score2.value }
             })
             await api('POST', `/plugin-rooms/pong/${currentRoom.value.id}/close`)
             currentRoom.value = { ...currentRoom.value, status: 'finished', data: { ...currentRoom.value.data, winner } }
-            activeRoom.value = null
+            activeRoom.value  = null
             stopGameLoop()
         } catch {}
     }
 }
 
-// ── Server sync ────────────────────────────────────────────────────────────
-async function pushState() {
-    if (!currentRoom.value || currentRoom.value.status !== 'active') return
-    try {
-        const b = ball.value
-        const patch = { p2_y: p2y.value }
-        if (mySeat.value === 1) {
-            Object.assign(patch, {
-                p1_y: p1y.value,
-                ball_x: b.x, ball_y: b.y,
-                ball_vx: b.vx, ball_vy: b.vy,
-                score1: score1.value, score2: score2.value,
-            })
+// ── WebRTC P2P ─────────────────────────────────────────────────────────────
+function startWebRTC() {
+    if (rtcPhase !== 'idle') return
+    rtcPhase = 'signaling'
+    localIce = []
+    remoteIceApplied = 0
+    answerSent = false
+    answerApplied = false
+
+    if (mySeat.value === 1) initAsOfferer()
+    else initAsAnswerer()
+
+    signalingTimer = setInterval(signalingPoll, SIGNAL_INTERVAL)
+}
+
+function stopWebRTC() {
+    if (signalingTimer) { clearInterval(signalingTimer); signalingTimer = null }
+    try { dc?.close() } catch {}
+    try { pc?.close() } catch {}
+    dc = null
+    pc = null
+    rtcPhase = 'idle'
+    localIce = []
+    remoteIceApplied = 0
+    answerSent = false
+    answerApplied = false
+}
+
+async function initAsOfferer() {
+    pc = new RTCPeerConnection({ iceServers: ICE_SERVERS })
+    pc.onicecandidate = (e) => { if (e.candidate) localIce.push(e.candidate.toJSON()) }
+
+    dc = pc.createDataChannel('pong', { ordered: false, maxRetransmits: 0 })
+    setupDataChannel(dc)
+
+    const offer = await pc.createOffer()
+    await pc.setLocalDescription(offer)
+
+    await api('PUT', `/plugin-rooms/pong/${currentRoom.value.id}/data`, {
+        data: { rtc_offer: offer.sdp, rtc_answer: null, rtc_ice_p1: [], rtc_ice_p2: [] }
+    }).catch(() => {})
+}
+
+function initAsAnswerer() {
+    pc = new RTCPeerConnection({ iceServers: ICE_SERVERS })
+    pc.onicecandidate = (e) => { if (e.candidate) localIce.push(e.candidate.toJSON()) }
+    pc.ondatachannel  = (e) => { dc = e.channel; setupDataChannel(dc) }
+    // Offer arrives via signalingPoll
+}
+
+function setupDataChannel(channel) {
+    channel.onopen = () => {
+        rtcPhase = 'connected'
+        if (signalingTimer) { clearInterval(signalingTimer); signalingTimer = null }
+        console.log('[pong] WebRTC data channel open — P2P active')
+    }
+    channel.onclose = () => {
+        if (rtcPhase === 'connected') {
+            console.warn('[pong] WebRTC data channel closed')
+            rtcPhase = 'failed'
         }
-        const data = await api('PUT', `/plugin-rooms/pong/${currentRoom.value.id}/data`, { data: patch })
-        if (data?.room) applyRoomState(data.room)
+    }
+    channel.onmessage = (e) => {
+        try { applyP2PState(JSON.parse(e.data)) } catch {}
+    }
+}
+
+function sendGameState() {
+    if (!dc || dc.readyState !== 'open') return
+    if (!currentRoom.value || currentRoom.value.status !== 'active') return
+    let state
+    if (mySeat.value === 1) {
+        const b = ball.value
+        state = { p1_y: p1y.value, ball_x: b.x, ball_y: b.y, ball_vx: b.vx, ball_vy: b.vy,
+                  score1: score1.value, score2: score2.value }
+    } else {
+        state = { p2_y: p2y.value }
+    }
+    try { dc.send(JSON.stringify(state)) } catch {}
+}
+
+function applyP2PState(state) {
+    if (state.winner != null) {
+        // Game over signal from peer
+        currentRoom.value = { ...currentRoom.value, status: 'finished',
+            data: { ...(currentRoom.value?.data ?? {}), winner: state.winner } }
+        stopGameLoop()
+        return
+    }
+    if (mySeat.value !== 1) {
+        if (state.ball_x  != null) ball.value.x  = state.ball_x
+        if (state.ball_y  != null) ball.value.y  = state.ball_y
+        if (state.ball_vx != null) ball.value.vx = state.ball_vx
+        if (state.ball_vy != null) ball.value.vy = state.ball_vy
+        if (state.p1_y    != null) p1y.value     = state.p1_y
+        if (state.score1  != null) score1.value  = state.score1
+        if (state.score2  != null) score2.value  = state.score2
+    }
+    if (mySeat.value !== 2) {
+        if (state.p2_y != null) p2y.value = state.p2_y
+    }
+}
+
+async function signalingPoll() {
+    if (rtcPhase !== 'signaling' || !currentRoom.value || !pc) return
+    try {
+        const data = await api('GET', `/plugin-rooms/pong/${currentRoom.value.id}`)
+        const d = data?.room?.data ?? {}
+
+        if (mySeat.value === 1) {
+            // Upload our ICE candidates (full list each time)
+            if (localIce.length > 0) {
+                await api('PUT', `/plugin-rooms/pong/${currentRoom.value.id}/data`, {
+                    data: { rtc_ice_p1: localIce }
+                }).catch(() => {})
+            }
+            // Apply P2's answer
+            if (!answerApplied && d.rtc_answer) {
+                answerApplied = true
+                await pc.setRemoteDescription({ type: 'answer', sdp: d.rtc_answer }).catch(() => {})
+            }
+            // Apply P2's ICE candidates
+            const p2ice = d.rtc_ice_p2 ?? []
+            for (const c of p2ice.slice(remoteIceApplied)) {
+                await pc.addIceCandidate(new RTCIceCandidate(c)).catch(() => {})
+            }
+            remoteIceApplied = p2ice.length
+
+        } else if (mySeat.value === 2) {
+            // Apply P1's offer
+            if (!answerSent && d.rtc_offer) {
+                answerSent = true
+                await pc.setRemoteDescription({ type: 'offer', sdp: d.rtc_offer })
+                const answer = await pc.createAnswer()
+                await pc.setLocalDescription(answer)
+                await api('PUT', `/plugin-rooms/pong/${currentRoom.value.id}/data`, {
+                    data: { rtc_answer: answer.sdp }
+                }).catch(() => {})
+            }
+            // Upload our ICE candidates
+            if (localIce.length > 0) {
+                await api('PUT', `/plugin-rooms/pong/${currentRoom.value.id}/data`, {
+                    data: { rtc_ice_p2: localIce }
+                }).catch(() => {})
+            }
+            // Apply P1's ICE candidates
+            const p1ice = d.rtc_ice_p1 ?? []
+            for (const c of p1ice.slice(remoteIceApplied)) {
+                await pc.addIceCandidate(new RTCIceCandidate(c)).catch(() => {})
+            }
+            remoteIceApplied = p1ice.length
+        }
     } catch {}
 }
 
-async function pullState() {
+// ── Spectator HTTP poll ─────────────────────────────────────────────────────
+async function spectatorPoll() {
     if (!currentRoom.value) return
     try {
         const data = await api('GET', `/plugin-rooms/pong/${currentRoom.value.id}`)
@@ -530,37 +662,33 @@ function applyRoomState(room) {
     currentRoom.value = room
     const d = room.data ?? {}
 
-    if (mySeat.value !== 1) {
-        // P2 and spectators get P1's ball and P1's paddle from server
-        if (d.ball_x  != null) ball.value.x  = d.ball_x
-        if (d.ball_y  != null) ball.value.y  = d.ball_y
-        if (d.ball_vx != null) ball.value.vx = d.ball_vx
-        if (d.ball_vy != null) ball.value.vy = d.ball_vy
-        if (d.p1_y    != null) p1y.value     = d.p1_y
-        if (d.score1  != null) score1.value  = d.score1
-        if (d.score2  != null) score2.value  = d.score2
-    }
-    if (mySeat.value !== 2) {
-        if (d.p2_y != null) p2y.value = d.p2_y
+    // Spectators always read from server; players only read when WebRTC not yet connected
+    if (mySeat.value == null || rtcPhase !== 'connected') {
+        if (mySeat.value !== 1) {
+            if (d.ball_x  != null) ball.value.x  = d.ball_x
+            if (d.ball_y  != null) ball.value.y  = d.ball_y
+            if (d.ball_vx != null) ball.value.vx = d.ball_vx
+            if (d.ball_vy != null) ball.value.vy = d.ball_vy
+            if (d.p1_y    != null) p1y.value     = d.p1_y
+            if (d.score1  != null) score1.value  = d.score1
+            if (d.score2  != null) score2.value  = d.score2
+        }
+        if (mySeat.value !== 2) {
+            if (d.p2_y != null) p2y.value = d.p2_y
+        }
     }
 
-    if (room.status === 'active' && mySeat.value == null) {
-        syncSeatFromRoom()
-    }
-    if (room.status === 'finished') {
-        stopGameLoop()
-    }
+    if (room.status === 'active' && mySeat.value == null) syncSeatFromRoom()
+    if (room.status === 'finished') stopGameLoop()
 }
 
-function ensureFocus() {
-    canvasRef.value?.focus()
-}
+function ensureFocus() { canvasRef.value?.focus() }
 
 // ── Drawing ────────────────────────────────────────────────────────────────
 function draw() {
     const canvas = canvasRef.value
     if (!canvas) return
-    const ctx = canvas.getContext('2d')
+    const ctx  = canvas.getContext('2d')
     const room = currentRoom.value
     const d    = room?.data ?? {}
 
@@ -568,7 +696,6 @@ function draw() {
     ctx.fillStyle = '#000'
     ctx.fillRect(0, 0, CW, CH)
 
-    // Dotted center line
     ctx.save()
     ctx.setLineDash([8, 8])
     ctx.strokeStyle = 'rgba(255,255,255,0.15)'
@@ -579,50 +706,33 @@ function draw() {
     ctx.stroke()
     ctx.restore()
 
-    // Left paddle
-    const p1Color = d.p1_color || '#ffffff'
-    ctx.fillStyle = p1Color
-    const p1px = 12
-    const p1py = p1y.value * CH - PADDLE_H / 2
-    ctx.fillRect(p1px, p1py, PADDLE_W, PADDLE_H)
+    ctx.fillStyle = d.p1_color || '#ffffff'
+    ctx.fillRect(12, p1y.value * CH - PADDLE_H / 2, PADDLE_W, PADDLE_H)
 
-    // Right paddle
-    const p2Color = d.p2_color || '#ff4444'
-    ctx.fillStyle = p2Color
-    const p2px = CW - 12 - PADDLE_W
-    const p2py = p2y.value * CH - PADDLE_H / 2
-    ctx.fillRect(p2px, p2py, PADDLE_W, PADDLE_H)
+    ctx.fillStyle = d.p2_color || '#ff4444'
+    ctx.fillRect(CW - 12 - PADDLE_W, p2y.value * CH - PADDLE_H / 2, PADDLE_W, PADDLE_H)
 
-    // Ball (skip if game not started/finished)
     if (room?.status === 'active') {
         ctx.fillStyle = '#fff'
-        const bx = ball.value.x * CW - BALL_SZ / 2
-        const by = ball.value.y * CH - BALL_SZ / 2
-        ctx.fillRect(bx, by, BALL_SZ, BALL_SZ)
+        ctx.fillRect(ball.value.x * CW - BALL_SZ / 2, ball.value.y * CH - BALL_SZ / 2, BALL_SZ, BALL_SZ)
     }
 
-    // Scores
-    ctx.font = 'bold 36px "Courier New", monospace'
+    ctx.font      = 'bold 36px "Courier New", monospace'
     ctx.textAlign = 'center'
     ctx.fillStyle = 'rgba(255,255,255,0.9)'
-    ctx.fillText(score1.value, CW / 4, 52)
+    ctx.fillText(score1.value, CW / 4,       52)
     ctx.fillText(score2.value, (3 * CW) / 4, 52)
 }
 
 // ── Keyboard ───────────────────────────────────────────────────────────────
 function onKeyDown(e) {
-    if (e.key === 'ArrowUp' || e.key === 'ArrowDown') {
-        e.preventDefault()
-        keys[e.key] = true
-    }
+    if (e.key === 'ArrowUp' || e.key === 'ArrowDown') { e.preventDefault(); keys[e.key] = true }
 }
 function onKeyUp(e) { keys[e.key] = false }
 
 // ── Close on outside click ─────────────────────────────────────────────────
 function onClickOutside(e) {
-    if (open.value && wrapRef.value && !wrapRef.value.contains(e.target)) {
-        open.value = false
-    }
+    if (open.value && wrapRef.value && !wrapRef.value.contains(e.target)) open.value = false
 }
 
 // ── Invite / open events ───────────────────────────────────────────────────
@@ -630,17 +740,15 @@ function onInvite(e) {
     const { author, channelId } = e.detail
     if (channelId !== props.channelId) return
     invitedUsername.value = author
-    config.value.p1Color = '#4488ff'
-    config.value.p2Color = '#ff4444'
+    config.value.p1Color  = '#4488ff'
+    config.value.p2Color  = '#ff4444'
     computeStyles()
     open.value = true
 }
 
 function onOpen(e) {
     const { id } = e.detail
-    if (currentRoom.value?.id === id || activeRoom.value?.id === id) {
-        openGame()
-    }
+    if (currentRoom.value?.id === id || activeRoom.value?.id === id) openGame()
 }
 
 // ── Lifecycle ──────────────────────────────────────────────────────────────
@@ -664,9 +772,7 @@ onUnmounted(() => {
     clearInterval(checkTimer)
 })
 
-watch(gameOpen, (v) => {
-    if (!v) stopGameLoop()
-})
+watch(gameOpen, (v) => { if (!v) stopGameLoop() })
 </script>
 
 <style scoped>
