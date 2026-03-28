@@ -123,7 +123,7 @@
                     <span v-else class="pong-panel-role">Spectating</span>
 
                     <button
-                        v-if="isRoomCreator && currentRoom.status !== 'finished'"
+                        v-if="mySeat && currentRoom.status !== 'finished'"
                         class="pong-panel-abandon"
                         @click="abandonGame"
                     >Abandon</button>
