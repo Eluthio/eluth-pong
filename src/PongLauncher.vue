@@ -200,9 +200,10 @@ const config = ref({ scoreLimit: 5, p1Color: '#ffffff', p2Color: '#ff4444' })
 const configStyle = ref({})
 
 // Timing & loops
-let rafId      = null
-let pollTimer  = null   // spectator HTTP poll only
-let checkTimer = null
+let rafId             = null
+let pollTimer         = null   // spectator HTTP poll only
+let checkTimer        = null
+let lastActiveRoomId  = null   // last room seen active in this channel; used to mark cards ended
 const keys = {}
 
 // WebRTC
@@ -291,11 +292,25 @@ async function api(method, path, body) {
 }
 
 // ── Room management ────────────────────────────────────────────────────────
+function markCardAsEnded(roomId) {
+    document.querySelectorAll(`.pong-msg-card[data-pong-id="${roomId}"] .pong-card-btn`).forEach(btn => {
+        btn.textContent = 'Game ended'
+        btn.disabled = true
+    })
+}
+
 async function checkActiveRoom() {
     if (!props.channelId) return
     try {
         const data = await api('GET', `/plugin-rooms/pong/channels/${props.channelId}`)
-        activeRoom.value = data?.room ?? null
+        const room = data?.room ?? null
+        activeRoom.value = room
+        if (!room && lastActiveRoomId) {
+            markCardAsEnded(lastActiveRoomId)
+            lastActiveRoomId = null
+        } else if (room) {
+            lastActiveRoomId = room.id
+        }
         if (currentRoom.value && data?.room?.id === currentRoom.value.id) {
             currentRoom.value = data.room
             // Only apply server state for room metadata (status, player list)
@@ -799,7 +814,14 @@ watch(() => props.channelId, () => {
     gameOpen.value      = false
     isRoomCreator.value = false
     open.value          = false
+    lastActiveRoomId    = null
     checkActiveRoom()
+})
+
+watch(() => currentRoom.value?.status, (status) => {
+    if (status === 'finished' && currentRoom.value?.id) {
+        markCardAsEnded(currentRoom.value.id)
+    }
 })
 </script>
 
