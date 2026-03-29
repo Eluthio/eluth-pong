@@ -751,7 +751,13 @@ async function onOpen(e) {
     try {
         const data = await api('GET', `/plugin-rooms/pong/${id}`)
         const room = data?.room
-        if (!room || room.status === 'finished') return
+        if (!room || room.status === 'finished') {
+            document.querySelectorAll(`.pong-msg-card[data-pong-id="${id}"] .pong-card-btn`).forEach(btn => {
+                btn.textContent = 'Game ended'
+                btn.disabled = true
+            })
+            return
+        }
         currentRoom.value = room
         activeRoom.value  = room
         syncSeatFromRoom()
