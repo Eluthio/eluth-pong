@@ -742,9 +742,24 @@ function onInvite(e) {
     open.value = true
 }
 
-function onOpen(e) {
+async function onOpen(e) {
     const { id } = e.detail
-    if (currentRoom.value?.id === id || activeRoom.value?.id === id) openGame()
+    if (currentRoom.value?.id === id || activeRoom.value?.id === id) {
+        openGame()
+        return
+    }
+    try {
+        const data = await api('GET', `/plugin-rooms/pong/${id}`)
+        const room = data?.room
+        if (!room || room.status === 'finished') return
+        currentRoom.value = room
+        activeRoom.value  = room
+        syncSeatFromRoom()
+        computeStyles()
+        gameOpen.value = true
+        open.value = false
+        nextTick(startGameLoop)
+    } catch {}
 }
 
 // ── Lifecycle ──────────────────────────────────────────────────────────────
