@@ -201,7 +201,8 @@ const configStyle = ref({})
 
 // Timing & loops
 let rafId             = null
-let pollTimer         = null   // spectator HTTP poll only
+let pollTimer         = null   // spectator / P2 fallback HTTP poll
+let httpSyncTimer     = null   // P1 HTTP state write fallback
 let checkTimer        = null
 let lastActiveRoomId  = null   // last room seen active in this channel; used to mark cards ended
 const keys = {}
@@ -398,9 +399,14 @@ function startGameLoop() {
     stopGameLoop()
     rafId = requestAnimationFrame(gameLoop)
 
-    if (mySeat.value === 1 || mySeat.value === 2) {
-        // Start WebRTC signaling; HTTP sync only kicks in as fallback
+    if (mySeat.value === 1) {
+        // P1: authoritative — try WebRTC, also write to server as fallback for P2
         startWebRTC()
+        httpSyncTimer = setInterval(p1HttpSync, 200)
+    } else if (mySeat.value === 2) {
+        // P2: try WebRTC, also poll server as fallback (stopped once data channel opens)
+        startWebRTC()
+        pollTimer = setInterval(spectatorPoll, SPECTATOR_POLL)
     } else {
         // Spectator: HTTP poll only
         pollTimer = setInterval(spectatorPoll, SPECTATOR_POLL)
@@ -410,8 +416,9 @@ function startGameLoop() {
 }
 
 function stopGameLoop() {
-    if (rafId)     { cancelAnimationFrame(rafId); rafId = null }
-    if (pollTimer) { clearInterval(pollTimer);    pollTimer = null }
+    if (rafId)         { cancelAnimationFrame(rafId); rafId = null }
+    if (pollTimer)     { clearInterval(pollTimer);     pollTimer = null }
+    if (httpSyncTimer) { clearInterval(httpSyncTimer); httpSyncTimer = null }
     stopWebRTC()
 }
 
@@ -558,6 +565,8 @@ function setupDataChannel(channel) {
     channel.onopen = () => {
         rtcPhase = 'connected'
         if (signalingTimer) { clearInterval(signalingTimer); signalingTimer = null }
+        if (pollTimer)      { clearInterval(pollTimer);      pollTimer = null }
+        if (httpSyncTimer)  { clearInterval(httpSyncTimer);  httpSyncTimer = null }
         console.log('[pong] WebRTC data channel open — P2P active')
     }
     channel.onclose = () => {
@@ -659,13 +668,28 @@ async function signalingPoll() {
     } catch {}
 }
 
-// ── Spectator HTTP poll ─────────────────────────────────────────────────────
+// ── Spectator / P2 fallback HTTP poll ──────────────────────────────────────
 async function spectatorPoll() {
     if (!currentRoom.value) return
     try {
         const data = await api('GET', `/plugin-rooms/pong/${currentRoom.value.id}`)
         if (data?.room) applyRoomState(data.room)
     } catch {}
+}
+
+// P1 HTTP sync — writes ball state to server so P2 can read it if WebRTC fails
+async function p1HttpSync() {
+    if (!currentRoom.value || currentRoom.value.status !== 'active') return
+    const b = ball.value
+    await api('PUT', `/plugin-rooms/pong/${currentRoom.value.id}/data`, {
+        data: {
+            ball_x:  b.x,  ball_y:  b.y,
+            ball_vx: b.vx, ball_vy: b.vy,
+            p1_y:    p1y.value,
+            score1:  score1.value,
+            score2:  score2.value,
+        },
+    }).catch(() => {})
 }
 
 function applyRoomState(room) {
