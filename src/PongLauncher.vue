@@ -344,7 +344,8 @@ async function createGame() {
         isRoomCreator.value = true
         open.value = false
 
-        const gameUrl = window.location.origin + '/pong-game/' + room.id
+        const serverOrigin = props.apiBase.replace(/\/api\/?$/, '').replace(/\/$/, '')
+        const gameUrl = serverOrigin + '/pong-game/' + room.id
         const mention = invitedUsername.value ? `@${invitedUsername.value} ` : ''
         emit('insert', mention + gameUrl)
         invitedUsername.value = null
